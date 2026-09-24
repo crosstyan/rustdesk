@@ -22,6 +22,31 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(150);
     // BENCH_SIZE=WxH, e.g. an odd height to check the NV12 layout.
+    // BENCH_PROBE=N: repeat the availability probe's create/encode-one/drop cycle N times.
+    if let Some(n) = std::env::var("BENCH_PROBE").ok().and_then(|v| v.parse::<usize>().ok()) {
+        for f in [CodecFormat::H264, CodecFormat::H265, CodecFormat::AV1] {
+            for i in 0..n {
+                let t = Instant::now();
+                let mut enc = Encoder::new(
+                    EncoderCfg::JETSON(JetsonEncoderConfig {
+                        format: f,
+                        width: 256,
+                        height: 256,
+                        quality: 1.0,
+                        keyframe_interval: None,
+                    }),
+                    false,
+                )
+                .expect("create");
+                let frame = vec![0x80u8; 256 * 256 * 4];
+                let r = enc.encode_to_message(scrap::EncodeInput::YUV(&frame), 0);
+                let t_enc = t.elapsed();
+                drop(enc);
+                println!("probe {f:?} #{i}: encode ok={} {:?}, total {:?}", r.is_ok(), t_enc, t.elapsed());
+            }
+        }
+        return;
+    }
     let (w, h) = std::env::var("BENCH_SIZE")
         .ok()
         .and_then(|v| {

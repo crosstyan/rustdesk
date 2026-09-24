@@ -460,7 +460,14 @@ impl JetsonEncoder {
 
 impl Drop for JetsonEncoder {
     fn drop(&mut self) {
+        // Let the encoder drain before NULL; tearing down with a frame inside nvv4l2av1enc can
+        // wedge the next AV1 session.
         self.appsrc.end_of_stream().ok();
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while !self.appsink.is_eos() && std::time::Instant::now() < deadline {
+            self.appsink
+                .try_pull_sample(gst::ClockTime::from_mseconds(50));
+        }
         self.pipeline.set_state(gst::State::Null).ok();
     }
 }
