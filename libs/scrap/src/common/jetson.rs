@@ -164,18 +164,16 @@ impl EncoderApi for JetsonEncoder {
         } else {
             FRAME_TIMEOUT
         };
+        // Pull only down to MAX_IN_FLIGHT: draining further would leave the next call with
+        // nothing finished to return.
         let mut frames = Vec::new();
-        loop {
-            let waiting = self.in_flight > MAX_IN_FLIGHT;
-            let wait = if waiting { timeout } else { Duration::ZERO };
+        while self.in_flight > MAX_IN_FLIGHT {
             let Some(sample) = self
                 .appsink
-                .try_pull_sample(gst::ClockTime::from_nseconds(wait.as_nanos() as _))
+                .try_pull_sample(gst::ClockTime::from_nseconds(timeout.as_nanos() as _))
             else {
-                if waiting {
-                    // An input produced no output; don't let the count drift.
-                    self.in_flight = MAX_IN_FLIGHT;
-                }
+                // An input produced no output; don't let the count drift.
+                self.in_flight = MAX_IN_FLIGHT;
                 break;
             };
             self.in_flight = self.in_flight.saturating_sub(1);
@@ -392,11 +390,13 @@ impl JetsonEncoder {
         let spawned = std::thread::Builder::new()
             .name("jetson-probe".to_owned())
             .spawn(|| {
-                for format in [CodecFormat::H264, CodecFormat::H265, CodecFormat::AV1] {
-                    let v = Self::probe(format);
-                    log::info!("jetson encoder {format:?} available: {v}");
-                    AVAILABLE.lock().unwrap().push((format, v));
-                }
+                // Publish together, after every probe encoder has been dropped.
+                let results: Vec<_> = [CodecFormat::H264, CodecFormat::H265, CodecFormat::AV1]
+                    .iter()
+                    .map(|&format| (format, Self::probe(format)))
+                    .collect();
+                log::info!("jetson encoder available: {results:?}");
+                *AVAILABLE.lock().unwrap() = results;
             });
         if let Err(e) = spawned {
             log::error!("jetson: failed to spawn probe thread: {e}");
