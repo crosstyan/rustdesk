@@ -1080,6 +1080,10 @@ fn get_encoder_config(
     // https://www.wowza.com/community/t/the-correct-keyframe-interval-in-obs-studio/95162
     let keyframe_interval = if record { Some(240) } else { None };
     let negotiated_codec = Encoder::negotiated_codec();
+    #[cfg(feature = "jetson")]
+    if let Some(cfg) = get_jetson_encoder_config(c, negotiated_codec, quality, keyframe_interval) {
+        return cfg;
+    }
     match negotiated_codec {
         CodecFormat::H264 | CodecFormat::H265 => {
             #[cfg(feature = "vram")]
@@ -1231,6 +1235,29 @@ fn check_privacy_mode_changed(
         bail!("SWITCH");
     }
     Ok(())
+}
+
+#[cfg(feature = "jetson")]
+fn get_jetson_encoder_config(
+    c: &CapturerInfo,
+    format: CodecFormat,
+    quality: f32,
+    keyframe_interval: Option<usize>,
+) -> Option<EncoderCfg> {
+    use scrap::{codec::jetson_available, jetson::JetsonEncoderConfig};
+
+    match format {
+        CodecFormat::H264 | CodecFormat::H265 | CodecFormat::AV1 if jetson_available(format) => {
+            Some(EncoderCfg::JETSON(JetsonEncoderConfig {
+                format,
+                width: c.width,
+                height: c.height,
+                quality,
+                keyframe_interval,
+            }))
+        }
+        _ => None,
+    }
 }
 
 #[inline]

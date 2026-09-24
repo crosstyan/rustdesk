@@ -25,6 +25,8 @@ mediacodec = ["ndk"]
 linux-pkg-config = ["dep:pkg-config"]
 hwcodec = ["dep:hwcodec"]
 vram = ["hwcodec/vram"]
+# NVIDIA Jetson NVENC (H.264/H.265/AV1) through GStreamer `nvv4l2*enc`, see common/jetson.rs.
+jetson = ["gstreamer", "gstreamer-app"]
 
 [dependencies]
 cfg-if = "1.0"

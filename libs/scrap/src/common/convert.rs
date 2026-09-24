@@ -191,6 +191,27 @@ pub fn convert_to_yuv(
                 src_height as _,
             ));
         }
+        // Encoders that take packed BGRA and convert on their own hardware (jetson.rs).
+        (crate::Pixfmt::BGRA, crate::Pixfmt::BGRA)
+        | (crate::Pixfmt::RGBA, crate::Pixfmt::BGRA)
+        | (crate::Pixfmt::RGB565LE, crate::Pixfmt::BGRA) => {
+            let dst_stride = dst_fmt.stride[0];
+            dst.resize(dst_stride * dst_fmt.h, 0);
+            let f = match src_pixfmt {
+                crate::Pixfmt::BGRA => ARGBCopy,
+                crate::Pixfmt::RGBA => ABGRToARGB,
+                crate::Pixfmt::RGB565LE => RGB565ToARGB,
+                _ => bail!(unsupported),
+            };
+            call_yuv!(f(
+                src.as_ptr(),
+                src_stride[0] as _,
+                dst.as_mut_ptr(),
+                dst_stride as _,
+                src_width as _,
+                src_height as _,
+            ));
+        }
         _ => {
             bail!(unsupported);
         }

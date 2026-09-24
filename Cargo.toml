@@ -29,6 +29,7 @@ flutter = ["flutter_rust_bridge"]
 default = ["use_dasp"]
 hwcodec = ["scrap/hwcodec"]
 vram = ["scrap/vram"]
+jetson = ["scrap/jetson"]
 mediacodec = ["scrap/mediacodec"]
 drm = ["scrap/drm"]
 # The display wake, as its OWN compile gate on top of `drm`. Everything else in the drm backend

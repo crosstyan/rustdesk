@@ -7,6 +7,8 @@ use std::{
 
 #[cfg(feature = "hwcodec")]
 use crate::hwcodec::*;
+#[cfg(feature = "jetson")]
+use crate::jetson::{JetsonEncoder, JetsonEncoderConfig};
 #[cfg(feature = "mediacodec")]
 use crate::mediacodec::{MediaCodecDecoder, H264_DECODER_SUPPORT, H265_DECODER_SUPPORT};
 #[cfg(feature = "vram")]
@@ -26,6 +28,7 @@ use base::message_proto::{
     feature = "hwcodec",
     feature = "mediacodec",
     feature = "vram",
+    feature = "jetson",
     target_os = "windows"
 ))]
 use hbb_common::config::option2bool;
@@ -55,6 +58,8 @@ pub enum EncoderCfg {
     HWRAM(HwRamEncoderConfig),
     #[cfg(feature = "vram")]
     VRAM(VRamEncoderConfig),
+    #[cfg(feature = "jetson")]
+    JETSON(JetsonEncoderConfig),
 }
 
 pub trait EncoderApi {
@@ -165,6 +170,18 @@ impl Encoder {
                     Err(e)
                 }
             },
+            #[cfg(feature = "jetson")]
+            EncoderCfg::JETSON(_) => match JetsonEncoder::new(config, i444) {
+                Ok(jetson) => Ok(Encoder {
+                    codec: Box::new(jetson),
+                }),
+                Err(e) => {
+                    log::error!("new jetson encoder failed: {e:?}, disable it");
+                    JetsonEncoder::disable_all();
+                    *ENCODE_CODEC_FORMAT.lock().unwrap() = CodecFormat::VP9;
+                    Err(e)
+                }
+            },
         }
     }
 
@@ -228,6 +245,15 @@ impl Encoder {
             if _all_support_h265_decoding {
                 h265hw_encoding =
                     HwRamEncoder::try_get(CodecFormat::H265).map_or(None, |c| Some(c.name));
+            }
+        }
+        #[cfg(feature = "jetson")]
+        {
+            if _all_support_h264_decoding && jetson_available(CodecFormat::H264) {
+                h264vram_encoding = true;
+            }
+            if _all_support_h265_decoding && jetson_available(CodecFormat::H265) {
+                h265vram_encoding = true;
             }
         }
         let h264_useable =
@@ -351,6 +377,11 @@ impl Encoder {
             encoding.h264 |= VRamEncoder::available(CodecFormat::H264).len() > 0;
             encoding.h265 |= VRamEncoder::available(CodecFormat::H265).len() > 0;
         }
+        #[cfg(feature = "jetson")]
+        {
+            encoding.h264 |= jetson_available(CodecFormat::H264);
+            encoding.h265 |= jetson_available(CodecFormat::H265);
+        }
         encoding
     }
 
@@ -392,6 +423,8 @@ impl Encoder {
                     return;
                 }
             },
+            #[cfg(feature = "jetson")]
+            EncoderCfg::JETSON(jetson) => jetson.format,
         };
         let current = ENCODE_CODEC_FORMAT.lock().unwrap().clone();
         if current != format {
@@ -415,6 +448,8 @@ impl Encoder {
             EncoderCfg::HWRAM(_) => false,
             #[cfg(feature = "vram")]
             EncoderCfg::VRAM(_) => false,
+            #[cfg(feature = "jetson")]
+            EncoderCfg::JETSON(_) => false,
         };
         prefer_i444 && i444_useable && !decodings.is_empty()
     }
@@ -847,7 +882,7 @@ impl Decoder {
     }
 }
 
-#[cfg(any(feature = "hwcodec", feature = "mediacodec"))]
+#[cfg(any(feature = "hwcodec", feature = "mediacodec", feature = "jetson"))]
 pub fn enable_hwcodec_option() -> bool {
     use base::config::keys::OPTION_ENABLE_HWCODEC;
 
@@ -859,6 +894,11 @@ pub fn enable_hwcodec_option() -> bool {
     }
     false
 }
+#[cfg(feature = "jetson")]
+pub fn jetson_available(format: CodecFormat) -> bool {
+    enable_hwcodec_option() && JetsonEncoder::available(format)
+}
+
 #[cfg(feature = "vram")]
 pub fn enable_vram_option(encode: bool) -> bool {
     use base::config::keys::OPTION_ENABLE_HWCODEC;
