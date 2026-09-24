@@ -84,6 +84,10 @@ fn nv12_stride(w: usize) -> usize {
     (w + 3) & !3
 }
 
+fn round_up_2(v: usize) -> usize {
+    (v + 1) & !1
+}
+
 // `bgra` (default) hands the captured frame to the VIC unchanged; `nv12` converts on the CPU
 // first like the other encoders do. Kept switchable for measuring.
 fn input_pixfmt() -> Pixfmt {
@@ -125,6 +129,7 @@ impl EncoderApi for JetsonEncoder {
         if data.len() < self.frame_size {
             bail!("frame too small: {} < {}", data.len(), self.frame_size);
         }
+        self.check_bus()?;
         let (released_tx, released_rx) = std::sync::mpsc::sync_channel::<()>(0);
         let mut buffer = gst::Buffer::from_slice(BorrowedFrame {
             ptr: data.as_ptr(),
@@ -134,7 +139,14 @@ impl EncoderApi for JetsonEncoder {
         if let Some(buffer) = buffer.get_mut() {
             buffer.set_pts(gst::ClockTime::from_mseconds(ms.max(0) as u64));
         }
-        let pushed = self.appsrc.push_buffer(buffer);
+        // Priming with a duplicate of the first frame keeps one frame in flight from the start, so
+        // every call has a finished frame to return.
+        let copies = if self.first { 2 } else { 1 };
+        let mut pushed = Ok(gst::FlowSuccess::Ok);
+        for _ in 0..copies {
+            pushed = pushed.and(self.appsrc.push_buffer(buffer.clone()));
+        }
+        drop(buffer);
         // `data` is only borrowed for this call, so wait until nvvidconv has copied it into NvMM
         // and dropped the buffer.
         if released_rx.recv_timeout(FIRST_FRAME_TIMEOUT)
@@ -145,24 +157,25 @@ impl EncoderApi for JetsonEncoder {
             bail!("jetson: input frame not released");
         }
         pushed.map_err(|e| anyhow!("push_buffer: {e:?}"))?;
-        self.in_flight += 1;
+        self.in_flight += copies;
 
-        let (max_in_flight, timeout) = if self.first {
-            (0, FIRST_FRAME_TIMEOUT)
+        let timeout = if self.first {
+            FIRST_FRAME_TIMEOUT
         } else {
-            (MAX_IN_FLIGHT, FRAME_TIMEOUT)
+            FRAME_TIMEOUT
         };
         let mut frames = Vec::new();
         loop {
-            let wait = if self.in_flight > max_in_flight {
-                timeout
-            } else {
-                Duration::ZERO
-            };
+            let waiting = self.in_flight > MAX_IN_FLIGHT;
+            let wait = if waiting { timeout } else { Duration::ZERO };
             let Some(sample) = self
                 .appsink
                 .try_pull_sample(gst::ClockTime::from_nseconds(wait.as_nanos() as _))
             else {
+                if waiting {
+                    // An input produced no output; don't let the count drift.
+                    self.in_flight = MAX_IN_FLIGHT;
+                }
                 break;
             };
             self.in_flight = self.in_flight.saturating_sub(1);
@@ -204,7 +217,7 @@ impl EncoderApi for JetsonEncoder {
                 w,
                 h,
                 stride: vec![nv12_stride(w), nv12_stride(w)],
-                u: nv12_stride(w) * h,
+                u: nv12_stride(w) * round_up_2(h),
                 v: 0,
             },
             _ => EncodeYuvFormat {
@@ -265,7 +278,10 @@ impl JetsonEncoder {
         let (w, h) = (config.width, config.height);
         let (caps_format, frame_size) = match input {
             // libyuv's ARGBToNV12 is BT.601; without this GStreamer assumes BT.709 for HD.
-            Pixfmt::NV12 => ("NV12,colorimetry=bt601", nv12_stride(w) * (h + (h + 1) / 2)),
+            Pixfmt::NV12 => (
+                "NV12,colorimetry=bt601",
+                nv12_stride(w) * (round_up_2(h) + round_up_2(h) / 2),
+            ),
             _ => ("BGRx", w * h * 4),
         };
         let bitrate = Self::calc_bitrate(&config, config.quality);
@@ -287,7 +303,7 @@ impl JetsonEncoder {
         };
         let desc = format!(
             "appsrc name=src is-live=true do-timestamp=false format=time block=false \
-               caps=video/x-raw,format={caps_format},width={w},height={h},framerate=0/1 \
+               caps=video/x-raw,format={caps_format},width={w},height={h},framerate=30/1 \
              ! nvvidconv ! video/x-raw(memory:NVMM),format=NV12,colorimetry=bt601 \
              ! {element} name=enc control-rate=1 bitrate={br} iframeinterval={gop} \
                idrinterval={gop} preset-level=1 maxperf-enable=true {codec_props} \
@@ -370,23 +386,41 @@ impl JetsonEncoder {
         DISABLED.store(true, Ordering::SeqCst);
     }
 
-    /// Whether the Jetson encoder for `format` works on this machine. The first call per format
-    /// encodes one small frame; the result is cached for the life of the process.
+    /// Probes every format on a background thread. Call once at server start; `available`
+    /// reports false until the probe for that format has finished.
+    pub fn start_probe() {
+        let spawned = std::thread::Builder::new()
+            .name("jetson-probe".to_owned())
+            .spawn(|| {
+                for format in [CodecFormat::H264, CodecFormat::H265, CodecFormat::AV1] {
+                    let v = Self::probe(format);
+                    log::info!("jetson encoder {format:?} available: {v}");
+                    AVAILABLE.lock().unwrap().push((format, v));
+                }
+            });
+        if let Err(e) = spawned {
+            log::error!("jetson: failed to spawn probe thread: {e}");
+        }
+    }
+
     pub fn available(format: CodecFormat) -> bool {
-        if DISABLED.load(Ordering::SeqCst) || element_name(format).is_none() {
+        if DISABLED.load(Ordering::SeqCst)
+            || std::env::var("RUSTDESK_JETSON_DISABLE").map_or(false, |v| v == "1")
+        {
             return false;
         }
-        if std::env::var("RUSTDESK_JETSON_DISABLE").map_or(false, |v| v == "1") {
+        // nvv4l2av1enc (L4T R36.4) intermittently emits streams that stop decoding after a few
+        // frames at some widths (1366, 1376, 3440 seen), so AV1 is opt-in.
+        if format == CodecFormat::AV1
+            && std::env::var("RUSTDESK_JETSON_AV1").map_or(true, |v| v != "1")
+        {
             return false;
         }
-        let mut cache = AVAILABLE.lock().unwrap();
-        if let Some((_, v)) = cache.iter().find(|(f, _)| *f == format) {
-            return *v;
-        }
-        let v = Self::probe(format);
-        log::info!("jetson encoder {format:?} available: {v}");
-        cache.push((format, v));
-        v
+        AVAILABLE
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(f, v)| *f == format && *v)
     }
 
     fn probe(format: CodecFormat) -> bool {

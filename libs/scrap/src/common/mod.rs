@@ -42,7 +42,7 @@ pub mod codec;
 pub mod convert;
 #[cfg(feature = "hwcodec")]
 pub mod hwcodec;
-#[cfg(all(target_os = "linux", feature = "jetson"))]
+#[cfg(feature = "jetson")]
 pub mod jetson;
 #[cfg(feature = "mediacodec")]
 pub mod mediacodec;

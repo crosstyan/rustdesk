@@ -21,7 +21,14 @@ fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(150);
-    let (w, h) = (3840usize, 2160usize);
+    // BENCH_SIZE=WxH, e.g. an odd height to check the NV12 layout.
+    let (w, h) = std::env::var("BENCH_SIZE")
+        .ok()
+        .and_then(|v| {
+            let (w, h) = v.split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        })
+        .unwrap_or((3840usize, 2160usize));
     let fps = 30u64;
 
     // A desktop-like frame: flat panels, a gradient, and a moving block.
@@ -43,8 +50,8 @@ fn main() {
                 f[p + 3] = 255;
             }
         }
-        let bx = (i * 97) % (w - 400);
-        for y in 800..1200 {
+        let bx = (i * 97) % (w - 400).max(1);
+        for y in 800.min(h)..1200.min(h) {
             for x in bx..bx + 400 {
                 let p = (y * w + x) * 4;
                 f[p..p + 4].copy_from_slice(&[0, 0, 255, 255]); // red block
@@ -149,8 +156,8 @@ fn main() {
                     // Flat-region pixels: sidebar, title bar, moving block.
                     let src = &frames[i % frames.len()];
                     let stride = rgb.raw.len() / h;
-                    let bx = ((i % frames.len()) * 97) % (w - 400);
-                    for (x, y) in [(100, 1000), (w / 2, 40), (bx + 200, 1000)] {
+                    let bx = ((i % frames.len()) * 97) % (w - 400).max(1);
+                    for (x, y) in [(100, h / 2), (w / 2, 40), (bx + 200, 1000.min(h - 1))] {
                         let d = &rgb.raw[y * stride + x * 4..][..3];
                         let s = &src[(y * w + x) * 4..][..3];
                         for c in 0..3 {

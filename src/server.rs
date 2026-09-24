@@ -683,6 +683,8 @@ pub async fn start_server(is_server: bool, no_server: bool) {
         crate::platform::try_kill_broker();
         #[cfg(feature = "hwcodec")]
         scrap::hwcodec::start_check_process();
+        #[cfg(feature = "jetson")]
+        scrap::jetson::JetsonEncoder::start_probe();
         crate::RendezvousMediator::start_all().await;
     } else {
         match crate::ipc::connect(1000, "").await {
