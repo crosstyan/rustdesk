@@ -46,6 +46,8 @@ pub use clipboard_service::is_clipboard_service_ok;
 pub(crate) mod wayland;
 #[cfg(all(target_os = "linux", feature = "drm"))]
 pub(crate) mod drm_capturer;
+#[cfg(all(target_os = "linux", feature = "drm", feature = "jetson"))]
+pub(crate) mod drm_jetson;
 #[cfg(target_os = "linux")]
 pub mod uinput;
 #[cfg(target_os = "linux")]

@@ -690,6 +690,8 @@ fn run(vs: VideoService) -> ResultType<()> {
     };
     #[cfg(feature = "vram")]
     c.set_output_texture(encoder.input_texture());
+    #[cfg(all(target_os = "linux", feature = "drm", feature = "jetson"))]
+    super::drm_jetson::set_wanted(matches!(encoder_cfg, EncoderCfg::JETSON(_)));
     #[cfg(target_os = "android")]
     if vs.source.is_monitor() {
         if let Err(e) = check_change_scale(encoder.is_hardware()) {
@@ -725,6 +727,9 @@ fn run(vs: VideoService) -> ResultType<()> {
     let mut mid_data = Vec::new();
     let mut repeat_encode_counter = 0;
     let repeat_encode_max = 10;
+    // The last frame was a Jetson GPU frame, which the encoder can repeat on its own.
+    #[cfg(feature = "jetson")]
+    let mut jetson_texture = false;
     let mut encode_fail_counter = 0;
     let mut first_frame = true;
     let capture_width = c.width;
@@ -800,6 +805,13 @@ fn run(vs: VideoService) -> ResultType<()> {
             Ok(frame) => {
                 repeat_encode_counter = 0;
                 if frame.valid() {
+                    #[cfg(feature = "jetson")]
+                    {
+                        jetson_texture = matches!(frame, scrap::Frame::Texture(_));
+                        if jetson_texture {
+                            yuv.clear();
+                        }
+                    }
                     let screenshot_key = (vs.source, display_idx);
                     let screenshot = SCREENSHOTS.lock().unwrap().remove(&screenshot_key);
                     if let Some(mut screenshot) = screenshot {
@@ -829,6 +841,8 @@ fn run(vs: VideoService) -> ResultType<()> {
                                 } else {
                                     #[cfg(all(windows, feature = "vram"))]
                                     VRamEncoder::set_not_use(sp.name(), true);
+                                    #[cfg(all(target_os = "linux", feature = "drm", feature = "jetson"))]
+                                    super::drm_jetson::suspend();
                                     screenshot.restore_vram = true;
                                     SCREENSHOTS
                                         .lock()
@@ -843,6 +857,8 @@ fn run(vs: VideoService) -> ResultType<()> {
                             handle_screenshot(screenshot, msg, w, h, data);
                         });
                         if restore_vram {
+                            #[cfg(all(target_os = "linux", feature = "drm", feature = "jetson"))]
+                            super::drm_jetson::resume();
                             bail!("SWITCH");
                         }
                     }
@@ -927,6 +943,28 @@ fn run(vs: VideoService) -> ResultType<()> {
                         frame_controller.set_send(now, send_conn_ids);
                         send_counter += 1;
                     }
+                }
+                // A null texture asks the Jetson encoder to push its last frame out again.
+                #[cfg(feature = "jetson")]
+                if !encoder.latency_free()
+                    && jetson_texture
+                    && repeat_encode_counter < repeat_encode_max
+                {
+                    repeat_encode_counter += 1;
+                    let send_conn_ids = handle_one_frame(
+                        display_idx,
+                        &sp,
+                        EncodeInput::Texture((std::ptr::null_mut(), 0)),
+                        ms,
+                        &mut encoder,
+                        recorder.clone(),
+                        &mut encode_fail_counter,
+                        &mut first_frame,
+                        capture_width,
+                        capture_height,
+                    )?;
+                    frame_controller.set_send(now, send_conn_ids);
+                    send_counter += 1;
                 }
             }
             Err(err) => {

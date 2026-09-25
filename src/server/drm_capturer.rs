@@ -32,6 +32,9 @@ struct FrameSlot {
     // SEPARATE acquisitions, so the encoder can hand its borrow back in between.
     free: [Option<Vec<u8>>; 2],
     ended: Option<String>,
+    // A zero-copy frame (drm_jetson), exclusive with `latest`.
+    #[cfg(feature = "jetson")]
+    latest_gpu: Option<Arc<scrap::jetson::JetsonSurface>>,
 }
 
 impl FrameSlot {
@@ -40,6 +43,18 @@ impl FrameSlot {
             self.recycle(old);
         }
         self.latest = Some((w, h, fmt, buf));
+        #[cfg(feature = "jetson")]
+        {
+            self.latest_gpu = None;
+        }
+    }
+
+    #[cfg(feature = "jetson")]
+    fn publish_gpu(&mut self, surface: Arc<scrap::jetson::JetsonSurface>) {
+        if let Some((.., old)) = self.latest.take() {
+            self.recycle(old);
+        }
+        self.latest_gpu = Some(surface);
     }
 
     fn recycle(&mut self, buf: Vec<u8>) {
@@ -85,6 +100,9 @@ pub struct IpcDrmCapturer {
     cur_h: usize,
     cur_fmt: Pixfmt,
     got_frame: bool,
+    // The zero-copy frame handed out by the last frame() call, kept alive while it is encoded.
+    #[cfg(feature = "jetson")]
+    cur_gpu: Option<Arc<scrap::jetson::JetsonSurface>>,
 }
 
 /// A list index is NOT an identity: `drm_enumerate_all_displays` concatenates per-card lists.
@@ -323,6 +341,8 @@ impl IpcDrmCapturer {
                 latest: None,
                 free: [None, None],
                 ended: None,
+                #[cfg(feature = "jetson")]
+                latest_gpu: None,
             }),
             cv: Condvar::new(),
             transform: std::sync::atomic::AtomicI32::new(TRANSFORM_PENDING),
@@ -373,6 +393,8 @@ impl IpcDrmCapturer {
                 cur_h: 0,
                 cur_fmt: Pixfmt::BGRA,
                 got_frame: false,
+                #[cfg(feature = "jetson")]
+                cur_gpu: None,
             },
             displays,
             wire_idx,
@@ -409,6 +431,55 @@ impl IpcDrmCapturer {
     }
 }
 
+#[cfg(feature = "jetson")]
+impl IpcDrmCapturer {
+    /// frame() for a zero-copy surface: the same session checks as the CPU path, minus rotation
+    /// (drm_jetson only converts unrotated outputs).
+    fn deliver_gpu<'a>(
+        &'a mut self,
+        surface: Arc<scrap::jetson::JetsonSurface>,
+    ) -> io::Result<Frame<'a>> {
+        // Encoder changed since this frame was converted: it no longer takes GPU frames.
+        if !super::drm_jetson::wanted() {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        if scrap::wayland::display::wayland_snapshot_generation() != self.snapshot_gen {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("drm: display {} layout changed; rebuilding", self.display),
+            ));
+        }
+        let (fw, fh) = (surface.width(), surface.height());
+        if self.session_size.is_some_and(|(sw, sh)| (fw, fh) != (sw, sh)) {
+            if !self.got_frame {
+                self.note_session_without_frame();
+            }
+            let (sw, sh) = self.session_size.unwrap_or_default();
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "drm: display {} frame {fw}x{fh} does not match the session's {sw}x{sh}; rebuilding",
+                    self.display
+                ),
+            ));
+        }
+        if !self.got_frame {
+            self.got_frame = true;
+            if let Some(key) = &self.connector {
+                if let Some(h) = DRM_DISPLAY_HEALTH.lock().unwrap().get_mut(key) {
+                    h.zero_frame_streak = 0;
+                    h.demotes = 0;
+                    h.since = Instant::now();
+                    h.fallback_rejected = false;
+                }
+            }
+        }
+        let texture = scrap::jetson::JetsonSurface::texture(&surface);
+        self.cur_gpu = Some(surface);
+        Ok(Frame::Texture(texture))
+    }
+}
+
 impl Drop for IpcDrmCapturer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -421,7 +492,11 @@ impl TraitCapturer for IpcDrmCapturer {
         {
             let mut slot = self.shared.slot.lock().unwrap();
             loop {
-                if slot.latest.is_some() || slot.ended.is_some() {
+                #[cfg(feature = "jetson")]
+                let has_gpu = slot.latest_gpu.is_some();
+                #[cfg(not(feature = "jetson"))]
+                let has_gpu = false;
+                if slot.latest.is_some() || slot.ended.is_some() || has_gpu {
                     break;
                 }
                 let now = Instant::now();
@@ -431,6 +506,11 @@ impl TraitCapturer for IpcDrmCapturer {
                 let (guard, _timed_out) =
                     self.shared.cv.wait_timeout(slot, deadline - now).unwrap();
                 slot = guard;
+            }
+            #[cfg(feature = "jetson")]
+            if let Some(surface) = slot.latest_gpu.take() {
+                drop(slot);
+                return self.deliver_gpu(surface);
             }
             if let Some((w, h, fmt, buf)) = slot.latest.take() {
                 drop(slot);
@@ -603,6 +683,8 @@ async fn recv_thread(
         RenderConverter::open_render(Some(render_node.as_str()))
     };
     let need_cpu = converter.is_none();
+    #[cfg(feature = "jetson")]
+    let mut jetson = super::drm_jetson::JetsonCapture::default();
     if need_cpu {
         log::info!(
             "drm: requesting the CPU-converted frame path for display {display} ({})",
@@ -669,6 +751,23 @@ async fn recv_thread(
                 } else {
                     -1
                 };
+                #[cfg(feature = "jetson")]
+                {
+                    jetson.note(&desc, received_fd);
+                    let transform = shared.transform.load(std::sync::atomic::Ordering::Acquire);
+                    if let Some(surface) = jetson.convert(&desc, transform) {
+                        let mut slot = shared.slot.lock().unwrap();
+                        slot.publish_gpu(surface);
+                        shared.cv.notify_one();
+                        drop(slot);
+                        if let Err(err) = conn.send_frame_ack().await {
+                            break format!("frame ack: {err}");
+                        }
+                        continue;
+                    }
+                }
+                #[cfg(feature = "jetson")]
+                let received_fd = jetson.gl_fd(&desc, received_fd);
                 let mut ddesc = drmtap_dmabuf_desc {
                     dma_buf_fd: -1,
                     width: desc.width,
@@ -1781,6 +1880,8 @@ mod drm_capturer_tests {
                     latest: None,
                     free: [None, None],
                     ended: None,
+                    #[cfg(feature = "jetson")]
+                    latest_gpu: None,
                 }),
                 cv: Condvar::new(),
                 transform: std::sync::atomic::AtomicI32::new(0),
@@ -1796,6 +1897,8 @@ mod drm_capturer_tests {
             cur_h: 0,
             cur_fmt: Pixfmt::BGRA,
             got_frame: false,
+            #[cfg(feature = "jetson")]
+            cur_gpu: None,
         }
     }
 
