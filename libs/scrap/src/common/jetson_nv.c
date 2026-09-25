@@ -43,12 +43,20 @@ static NvBufSurfaceColorFormat color_format(int fmt) {
 }
 
 // Imports a single-plane RGB dma-buf (e.g. a KMS scanout). `block_height_log2` < 0 means pitch
-// linear, otherwise NVIDIA block linear with that GOB block height. The caller keeps `fd` open for
-// the surface's lifetime.
+// linear, otherwise NVIDIA block linear with that GOB block height. `fd` stays the caller's: the
+// surface imports a duplicate, which NvBufSurfaceDestroy closes.
 NvBufSurface *jz_import(int fd, uint32_t w, uint32_t h, int fmt, uint32_t pitch, uint32_t offset,
                         int block_height_log2) {
+  // NvBufSurface looks buffers up by fd number, and libnvv4l2 leaves stale entries behind for fds
+  // it closed; a low recycled number can resolve to one of those. Keep imports out of that range.
+  int own = fcntl(fd, F_DUPFD_CLOEXEC, 512);
+  if (own < 0) return NULL;
+  fd = own;
   off_t size = lseek(fd, 0, SEEK_END);
-  if (size <= 0) return NULL;
+  if (size <= 0) {
+    close(own);
+    return NULL;
+  }
   NvBufSurfaceMapParams mp;
   memset(&mp, 0, sizeof mp);
   mp.num_planes = 1;
@@ -64,7 +72,10 @@ NvBufSurface *jz_import(int fd, uint32_t w, uint32_t h, int fmt, uint32_t pitch,
   mp.planes[0].psize = size;
   mp.planes[0].blockheightlog2 = block_height_log2 < 0 ? 0 : block_height_log2;
   NvBufSurface *s = NULL;
-  if (NvBufSurfaceImport(&s, &mp) != 0) return NULL;
+  if (NvBufSurfaceImport(&s, &mp) != 0) {
+    close(own);
+    return NULL;
+  }
   s->numFilled = 1;
   return s;
 }

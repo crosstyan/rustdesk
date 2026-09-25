@@ -8,7 +8,7 @@ use hbb_common::log;
 use scrap::jetson::JetsonSurface;
 use std::{
     collections::{HashMap, VecDeque},
-    os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -116,7 +116,7 @@ impl JetsonCapture {
                     return Ok(None);
                 };
                 let surface = JetsonSurface::import(
-                    fd.try_clone()?,
+                    fd.as_fd(),
                     w,
                     h,
                     desc.format,

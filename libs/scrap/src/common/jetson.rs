@@ -24,7 +24,7 @@ use hbb_common::{
 };
 use std::{
     ffi::{c_char, c_int, c_void, CStr},
-    os::fd::{AsRawFd, OwnedFd},
+    os::fd::{AsRawFd, BorrowedFd},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -103,13 +103,13 @@ lazy_static::lazy_static! {
 }
 static DISABLED: AtomicBool = AtomicBool::new(false);
 
-/// An NvBufSurface: either allocated here, or an imported dma-buf whose fd it keeps open.
+/// An NvBufSurface: either allocated here, or an imported dma-buf (the import owns a duplicate of
+/// the fd, closed by NvBufSurfaceDestroy).
 pub struct JetsonSurface {
     ptr: *mut NvBufSurface,
     width: usize,
     height: usize,
     nv12: bool,
-    _fd: Option<OwnedFd>,
 }
 
 // NvBufSurface handles are process-wide; the buffer itself is only touched by the hardware or
@@ -132,14 +132,13 @@ impl JetsonSurface {
             width,
             height,
             nv12: fmt == JZ_FMT_NV12,
-            _fd: None,
         })
     }
 
     /// Imports a single-plane 32-bit RGB dma-buf (a KMS scanout). Handles linear and NVIDIA
     /// block-linear (`DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D`) layouts.
     pub fn import(
-        fd: OwnedFd,
+        fd: BorrowedFd,
         width: usize,
         height: usize,
         drm_format: u32,
@@ -186,7 +185,6 @@ impl JetsonSurface {
             width,
             height,
             nv12: false,
-            _fd: Some(fd),
         })
     }
 
