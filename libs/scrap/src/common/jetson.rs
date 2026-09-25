@@ -321,19 +321,21 @@ impl EncoderApi for JetsonEncoder {
         // Pull only down to MAX_IN_FLIGHT: draining further would leave the next call with
         // nothing finished to return.
         let mut frames = Vec::new();
+        let mut dequeued = false;
         while self.in_flight > MAX_IN_FLIGHT {
             let (mut data, mut len, mut key, mut pts_us) = (std::ptr::null(), 0u32, 0, 0i64);
             let index =
                 unsafe { jz_enc_dequeue(self.enc, timeout, &mut data, &mut len, &mut key, &mut pts_us) };
             if index == -1 {
-                // An input produced no output; don't let the count drift.
-                self.in_flight = MAX_IN_FLIGHT;
+                // Late, not lost: the count stays, so the next call collects it. An encoder that
+                // stays silent keeps failing until video_service switches away from it.
                 break;
             }
             if index < 0 {
                 bail!("jetson: DQBUF capture failed: {}", std::io::Error::last_os_error());
             }
             self.in_flight -= 1;
+            dequeued = true;
             // SAFETY: jz_enc_dequeue bounds `len` by the mapped capture buffer, which stays valid
             // until jz_enc_release.
             let bytes = unsafe { std::slice::from_raw_parts(data, len as usize) };
@@ -348,10 +350,13 @@ impl EncoderApi for JetsonEncoder {
             unsafe { jz_enc_release(self.enc, index) };
         }
         self.reclaim_slots(0);
+        // Primed once the encoder has answered, even with an empty access unit.
+        if dequeued {
+            self.first = false;
+        }
         if frames.is_empty() {
             bail!("no valid frame");
         }
-        self.first = false;
         let frames = EncodedVideoFrames {
             frames: frames.into(),
             ..Default::default()

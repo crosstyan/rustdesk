@@ -71,9 +71,8 @@ impl JetsonCapture {
         // A new fd for a known id is a new buffer: forget the old imports.
         self.imports.remove(&desc.fb_id);
         self.gl_seen.remove(&desc.fb_id);
-        if self.fds.insert(desc.fb_id, dup).is_none() {
-            self.order.push_back(desc.fb_id);
-        }
+        self.fds.insert(desc.fb_id, dup);
+        self.touch(desc.fb_id);
         while self.order.len() > MAX_FBS {
             if let Some(old) = self.order.pop_front() {
                 self.fds.remove(&old);
@@ -83,9 +82,20 @@ impl JetsonCapture {
         }
     }
 
+    // Least recently shown last: eviction must never take a framebuffer still being flipped to,
+    // since the producer will not send its fd again.
+    fn touch(&mut self, fb_id: u32) {
+        if !self.fds.contains_key(&fb_id) {
+            return;
+        }
+        self.order.retain(|&id| id != fb_id);
+        self.order.push_back(fb_id);
+    }
+
     /// The fd to hand the GL converter: its cache misses framebuffers whose fd arrived while
     /// frames were going through `convert` instead.
     pub(super) fn gl_fd(&mut self, desc: &DmabufDesc, received_fd: RawFd) -> RawFd {
+        self.touch(desc.fb_id);
         if received_fd >= 0 || self.gl_seen.contains_key(&desc.fb_id) {
             self.gl_seen.insert(desc.fb_id, ());
             return received_fd;
@@ -108,6 +118,7 @@ impl JetsonCapture {
         if transform != 0 || desc.hdr_eotf != 0 || desc.num_planes > 1 {
             return None;
         }
+        self.touch(desc.fb_id);
         let (w, h) = (desc.width as usize, desc.height as usize);
         let result = (|| -> hbb_common::ResultType<Option<Arc<JetsonSurface>>> {
             if !self.imports.contains_key(&desc.fb_id) {

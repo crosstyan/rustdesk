@@ -129,6 +129,8 @@ fn main() {
         let (mut yuv, mut mid) = (Vec::new(), Vec::new());
         let mut encoded = Vec::new();
         let mut enc_time = Duration::ZERO;
+        let repeats: usize = std::env::var("BENCH_REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let (mut repeat_ok, mut repeat_err) = (0usize, 0usize);
         let start = Instant::now();
         let cpu0 = cpu();
         for i in 0..n {
@@ -151,8 +153,30 @@ fn main() {
             if let Ok(vf) = vf {
                 encoded.push((i, vf));
             }
+            // BENCH_REPEAT=N: N idle repeats (null texture) after every frame, as video_service does.
+            for _ in 0..repeats {
+                match enc.encode_to_message(
+                    scrap::EncodeInput::Texture((std::ptr::null_mut(), 0)),
+                    (i as u64 * 1000 / fps) as i64,
+                ) {
+                    Ok(vf) => {
+                        repeat_ok += 1;
+                        // Decoded like any frame, not color-checked (usize::MAX).
+                        encoded.push((usize::MAX, vf));
+                    }
+                    Err(e) => {
+                        repeat_err += 1;
+                        if repeat_err <= 3 {
+                            println!("  repeat after frame {i}: {e:?}");
+                        }
+                    }
+                }
+            }
         }
         let wall = start.elapsed().as_secs_f64();
+        if repeats > 0 {
+            println!("{name}: idle repeats ok {repeat_ok}, failed {repeat_err}");
+        }
         let cpu_s = cpu() - cpu0;
         drop(enc);
 
