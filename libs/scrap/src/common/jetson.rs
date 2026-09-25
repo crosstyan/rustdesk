@@ -1,14 +1,11 @@
 // Hardware encoder for NVIDIA Jetson (L4T / JetPack).
 //
 // The Jetson NVENC block is not reachable through FFmpeg NVENC (no `libnvidia-encode.so` on
-// Tegra) nor VAAPI; it is exposed only through the V4L2/NvMM stack, which GStreamer wraps as
-// `nvv4l2h264enc` / `nvv4l2h265enc` / `nvv4l2av1enc`. The encoder runs
+// Tegra) nor VAAPI; it is exposed only through NVIDIA's libv4l2 plugin. jetson_nv.c drives it with
+// NvBufSurface dma-bufs, so frames stay in NvMM memory:
 //
-//   appsrc (system memory) ! nvvidconv ! video/x-raw(memory:NVMM),format=NV12
-//     ! nvv4l2XXXenc ! appsink
-//
-// `nvvidconv` does the copy into NvMM and, when the input is BGRx/RGBA, the color conversion on
-// the VIC engine, so the CPU never runs the RGB->YUV conversion.
+//   GPU frame (capturer converted the KMS scanout on the VIC) -> NV12 surface -> NVENC
+//   CPU frame (BGRA)   -> upload into an RGB surface -> VIC -> NV12 surface -> NVENC
 //
 // At 4K the VIC conversion and NVENC each take ~20 ms at idle clocks, so waiting for every frame's
 // own bitstream would cap the rate near 15 fps. One frame stays in flight instead: each call
@@ -20,34 +17,211 @@ use crate::{
     CodecFormat, EncodeInput, EncodeYuvFormat, Pixfmt,
 };
 use base::message_proto::{EncodedVideoFrame, EncodedVideoFrames, VideoFrame};
-use gstreamer as gst;
-use gstreamer::prelude::*;
-use gstreamer_app::{AppSink, AppSrc};
 use hbb_common::{
-    anyhow::{anyhow, bail, Context},
+    anyhow::{anyhow, bail},
     bytes::Bytes,
     log, ResultType,
 };
 use std::{
+    ffi::{c_char, c_int, c_void, CStr},
+    os::fd::{AsRawFd, OwnedFd},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
-    time::Duration,
 };
 
 const NVENC_DEVICE: &str = "/dev/v4l2-nvenc";
-// The first frame opens the V4L2 device and allocates NvMM pools; later frames take a few ms.
-const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(2000);
-const FRAME_TIMEOUT: Duration = Duration::from_millis(500);
+// The first frame allocates NvMM pools; later frames take a few ms.
+const FIRST_FRAME_TIMEOUT_MS: c_int = 2000;
+const FRAME_TIMEOUT_MS: c_int = 500;
 const MAX_IN_FLIGHT: usize = 1;
+// Output (input-frame) slots: in flight + the one being queued + the priming duplicate.
+const SLOTS: usize = 4;
 // Effectively "never", keyframes come from recreating the encoder (new subscriber, refresh).
 const DEFAULT_GOP: u32 = 1 << 30;
+// Tags an EncodeInput::Texture as an `Arc<JetsonSurface>` (see `texture`).
+const TEXTURE_TAG: usize = 0x6a65_7473;
+
+const JZ_FMT_NV12: c_int = 0;
+const JZ_FMT_BGRA: c_int = 1;
+const JZ_FMT_BGRX: c_int = 2;
+const JZ_FMT_RGBA: c_int = 3;
+const JZ_FMT_RGBX: c_int = 4;
+
+#[repr(C)]
+struct NvBufSurface {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct JzEnc {
+    _private: [u8; 0],
+}
+
+extern "C" {
+    fn jz_import(
+        fd: c_int,
+        w: u32,
+        h: u32,
+        fmt: c_int,
+        pitch: u32,
+        offset: u32,
+        block_height_log2: c_int,
+    ) -> *mut NvBufSurface;
+    fn jz_alloc(w: u32, h: u32, fmt: c_int) -> *mut NvBufSurface;
+    fn jz_destroy(s: *mut NvBufSurface);
+    fn jz_upload(dst: *mut NvBufSurface, src: *const u8, stride: u32, w: u32, h: u32) -> c_int;
+    fn jz_convert(src: *mut NvBufSurface, dst: *mut NvBufSurface) -> c_int;
+    fn jz_enc_open(
+        codec: c_int,
+        w: u32,
+        h: u32,
+        bitrate: u32,
+        gop: u32,
+        nout: c_int,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> *mut JzEnc;
+    fn jz_enc_close(e: *mut JzEnc);
+    fn jz_enc_set_bitrate(e: *mut JzEnc, bitrate: u32) -> c_int;
+    fn jz_enc_queue(e: *mut JzEnc, index: c_int, s: *mut NvBufSurface, pts_us: i64) -> c_int;
+    fn jz_enc_reclaim(e: *mut JzEnc, timeout_ms: c_int) -> c_int;
+    fn jz_enc_dequeue(
+        e: *mut JzEnc,
+        timeout_ms: c_int,
+        data: *mut *const u8,
+        len: *mut u32,
+        key: *mut c_int,
+        pts_us: *mut i64,
+    ) -> c_int;
+    fn jz_enc_release(e: *mut JzEnc, index: c_int) -> c_int;
+}
 
 lazy_static::lazy_static! {
     static ref AVAILABLE: Mutex<Vec<(CodecFormat, bool)>> = Default::default();
 }
 static DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// An NvBufSurface: either allocated here, or an imported dma-buf whose fd it keeps open.
+pub struct JetsonSurface {
+    ptr: *mut NvBufSurface,
+    width: usize,
+    height: usize,
+    nv12: bool,
+    _fd: Option<OwnedFd>,
+}
+
+// NvBufSurface handles are process-wide; the buffer itself is only touched by the hardware or
+// through jz_upload by the owner.
+unsafe impl Send for JetsonSurface {}
+unsafe impl Sync for JetsonSurface {}
+
+impl JetsonSurface {
+    pub fn alloc_nv12(width: usize, height: usize) -> ResultType<Self> {
+        Self::alloc(width, height, JZ_FMT_NV12)
+    }
+
+    fn alloc(width: usize, height: usize, fmt: c_int) -> ResultType<Self> {
+        let ptr = unsafe { jz_alloc(width as _, height as _, fmt) };
+        if ptr.is_null() {
+            bail!("jetson: NvBufSurfaceCreate {width}x{height} failed");
+        }
+        Ok(Self {
+            ptr,
+            width,
+            height,
+            nv12: fmt == JZ_FMT_NV12,
+            _fd: None,
+        })
+    }
+
+    /// Imports a single-plane 32-bit RGB dma-buf (a KMS scanout). Handles linear and NVIDIA
+    /// block-linear (`DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D`) layouts.
+    pub fn import(
+        fd: OwnedFd,
+        width: usize,
+        height: usize,
+        drm_format: u32,
+        modifier: u64,
+        pitch: u32,
+        offset: u32,
+    ) -> ResultType<Self> {
+        const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+        const NVIDIA_VENDOR: u64 = 0x03;
+        let fmt = match &drm_format.to_le_bytes() {
+            b"AR24" => JZ_FMT_BGRA,
+            b"XR24" => JZ_FMT_BGRX,
+            b"AB24" => JZ_FMT_RGBA,
+            b"XB24" => JZ_FMT_RGBX,
+            _ => bail!("jetson: unsupported scanout format {drm_format:#x}"),
+        };
+        let block_height_log2 = if modifier == DRM_FORMAT_MOD_LINEAR {
+            -1
+        } else if modifier >> 56 == NVIDIA_VENDOR && modifier & 0x10 != 0 {
+            // Compressed block-linear (bits 23..25) is not readable by the VIC.
+            if (modifier >> 23) & 0x7 != 0 {
+                bail!("jetson: compressed scanout modifier {modifier:#x}");
+            }
+            (modifier & 0xf) as c_int
+        } else {
+            bail!("jetson: unsupported scanout modifier {modifier:#x}");
+        };
+        let ptr = unsafe {
+            jz_import(
+                fd.as_raw_fd(),
+                width as _,
+                height as _,
+                fmt,
+                pitch,
+                offset,
+                block_height_log2,
+            )
+        };
+        if ptr.is_null() {
+            bail!("jetson: NvBufSurfaceImport failed ({width}x{height}, modifier {modifier:#x})");
+        }
+        Ok(Self {
+            ptr,
+            width,
+            height,
+            nv12: false,
+            _fd: Some(fd),
+        })
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Converts (or copies) into `dst` on the VIC. Both surfaces must have the same size.
+    pub fn convert_into(&self, dst: &JetsonSurface) -> ResultType<()> {
+        if (self.width, self.height) != (dst.width, dst.height) {
+            bail!("jetson: VIC size mismatch");
+        }
+        if unsafe { jz_convert(self.ptr, dst.ptr) } != 0 {
+            bail!("jetson: NvBufSurfTransform failed");
+        }
+        Ok(())
+    }
+
+    /// The EncodeInput::Texture handed to JetsonEncoder. The caller keeps `surface` alive for the
+    /// duration of the encode call; the encoder takes its own reference while the frame is in
+    /// flight, so a pool can reuse a surface once its strong count drops back to one.
+    pub fn texture(surface: &Arc<JetsonSurface>) -> (*mut c_void, usize) {
+        (Arc::as_ptr(surface) as *mut c_void, TEXTURE_TAG)
+    }
+}
+
+impl Drop for JetsonSurface {
+    fn drop(&mut self) {
+        unsafe { jz_destroy(self.ptr) };
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct JetsonEncoderConfig {
@@ -59,57 +233,28 @@ pub struct JetsonEncoderConfig {
 }
 
 pub struct JetsonEncoder {
-    pipeline: gst::Pipeline,
-    appsrc: AppSrc,
-    appsink: AppSink,
-    enc: gst::Element,
+    enc: *mut JzEnc,
     config: JetsonEncoderConfig,
-    input: Pixfmt,
-    frame_size: usize,
     bitrate: u32, // kbps
+    // The surface each output slot holds until the encoder has read it.
+    slots: [Option<Arc<JetsonSurface>>; SLOTS],
+    // CPU input: the upload target and the NV12 surfaces converted from it.
+    upload: Option<JetsonSurface>,
+    cpu_pool: Vec<Arc<JetsonSurface>>,
+    last: Option<Arc<JetsonSurface>>,
     in_flight: usize,
     first: bool,
 }
 
-fn element_name(format: CodecFormat) -> Option<&'static str> {
+// The V4L2 handle is only used by the thread that owns the encoder.
+unsafe impl Send for JetsonEncoder {}
+
+fn codec_id(format: CodecFormat) -> Option<c_int> {
     match format {
-        CodecFormat::H264 => Some("nvv4l2h264enc"),
-        CodecFormat::H265 => Some("nvv4l2h265enc"),
-        CodecFormat::AV1 => Some("nvv4l2av1enc"),
+        CodecFormat::H264 => Some(0),
+        CodecFormat::H265 => Some(1),
+        CodecFormat::AV1 => Some(2),
         _ => None,
-    }
-}
-
-fn nv12_stride(w: usize) -> usize {
-    (w + 3) & !3
-}
-
-fn round_up_2(v: usize) -> usize {
-    (v + 1) & !1
-}
-
-// `bgra` (default) hands the captured frame to the VIC unchanged; `nv12` converts on the CPU
-// first like the other encoders do. Kept switchable for measuring.
-fn input_pixfmt() -> Pixfmt {
-    match std::env::var("RUSTDESK_JETSON_INPUT").as_deref() {
-        Ok("nv12") => Pixfmt::NV12,
-        _ => Pixfmt::BGRA,
-    }
-}
-
-// The caller's frame, handed to GStreamer without a copy. Dropping it (when the pipeline releases
-// the buffer) disconnects `_released`.
-struct BorrowedFrame {
-    ptr: *const u8,
-    len: usize,
-    _released: std::sync::mpsc::SyncSender<()>,
-}
-
-unsafe impl Send for BorrowedFrame {}
-
-impl AsRef<[u8]> for BorrowedFrame {
-    fn as_ref(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
@@ -119,76 +264,93 @@ impl EncoderApi for JetsonEncoder {
         Self: Sized,
     {
         match cfg {
-            EncoderCfg::JETSON(config) => Self::create(config, input_pixfmt()),
+            EncoderCfg::JETSON(config) => Self::create(config),
             _ => bail!("encoder type mismatch"),
         }
     }
 
     fn encode_to_message(&mut self, input: EncodeInput, ms: i64) -> ResultType<VideoFrame> {
-        let data = input.yuv()?;
-        if data.len() < self.frame_size {
-            bail!("frame too small: {} < {}", data.len(), self.frame_size);
-        }
-        self.check_bus()?;
-        let (released_tx, released_rx) = std::sync::mpsc::sync_channel::<()>(0);
-        let mut buffer = gst::Buffer::from_slice(BorrowedFrame {
-            ptr: data.as_ptr(),
-            len: self.frame_size,
-            _released: released_tx,
-        });
-        if let Some(buffer) = buffer.get_mut() {
-            buffer.set_pts(gst::ClockTime::from_mseconds(ms.max(0) as u64));
-        }
+        let surface = match input {
+            EncodeInput::YUV(data) => self.upload_cpu_frame(data)?,
+            // A null texture asks to repeat the last frame (idle screen, see video_service).
+            EncodeInput::Texture((ptr, _)) if ptr.is_null() => {
+                self.last.clone().ok_or(anyhow!("jetson: no frame to repeat"))?
+            }
+            EncodeInput::Texture((ptr, tag)) => {
+                if tag != TEXTURE_TAG {
+                    bail!("jetson: not a jetson texture");
+                }
+                // SAFETY: `JetsonSurface::texture` produced `ptr` from an Arc the caller keeps
+                // alive for this call; take a reference of our own.
+                let surface = unsafe {
+                    Arc::increment_strong_count(ptr as *const JetsonSurface);
+                    Arc::from_raw(ptr as *const JetsonSurface)
+                };
+                if !surface.nv12
+                    || (surface.width, surface.height) != (self.config.width, self.config.height)
+                {
+                    bail!(
+                        "jetson: texture {}x{} does not match the encoder's {}x{}",
+                        surface.width,
+                        surface.height,
+                        self.config.width,
+                        self.config.height
+                    );
+                }
+                surface
+            }
+        };
+        self.last = Some(surface.clone());
+
         // Priming with a duplicate of the first frame keeps one frame in flight from the start, so
         // every call has a finished frame to return.
         let copies = if self.first { 2 } else { 1 };
-        let mut pushed = Ok(gst::FlowSuccess::Ok);
         for _ in 0..copies {
-            pushed = pushed.and(self.appsrc.push_buffer(buffer.clone()));
+            let slot = self.free_slot()?;
+            if unsafe { jz_enc_queue(self.enc, slot as _, surface.ptr, ms.max(0) * 1000) } != 0 {
+                bail!("jetson: QBUF failed: {}", std::io::Error::last_os_error());
+            }
+            self.slots[slot] = Some(surface.clone());
+            self.in_flight += 1;
         }
-        drop(buffer);
-        // `data` is only borrowed for this call, so wait until nvvidconv has copied it into NvMM
-        // and dropped the buffer.
-        if released_rx.recv_timeout(FIRST_FRAME_TIMEOUT)
-            != Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
-        {
-            self.pipeline.set_state(gst::State::Null).ok();
-            released_rx.recv().ok();
-            bail!("jetson: input frame not released");
-        }
-        pushed.map_err(|e| anyhow!("push_buffer: {e:?}"))?;
-        self.in_flight += copies;
+        drop(surface);
 
         let timeout = if self.first {
-            FIRST_FRAME_TIMEOUT
+            FIRST_FRAME_TIMEOUT_MS
         } else {
-            FRAME_TIMEOUT
+            FRAME_TIMEOUT_MS
         };
         // Pull only down to MAX_IN_FLIGHT: draining further would leave the next call with
         // nothing finished to return.
         let mut frames = Vec::new();
         while self.in_flight > MAX_IN_FLIGHT {
-            let Some(sample) = self
-                .appsink
-                .try_pull_sample(gst::ClockTime::from_nseconds(timeout.as_nanos() as _))
-            else {
+            let (mut data, mut len, mut key, mut pts_us) = (std::ptr::null(), 0u32, 0, 0i64);
+            let index =
+                unsafe { jz_enc_dequeue(self.enc, timeout, &mut data, &mut len, &mut key, &mut pts_us) };
+            if index == -1 {
                 // An input produced no output; don't let the count drift.
                 self.in_flight = MAX_IN_FLIGHT;
                 break;
-            };
-            self.in_flight = self.in_flight.saturating_sub(1);
-            if let Some(buf) = sample.get_buffer() {
-                let map = buf.map_readable()?;
+            }
+            if index < 0 {
+                bail!("jetson: DQBUF capture failed: {}", std::io::Error::last_os_error());
+            }
+            self.in_flight -= 1;
+            // SAFETY: jz_enc_dequeue bounds `len` by the mapped capture buffer, which stays valid
+            // until jz_enc_release.
+            let bytes = unsafe { std::slice::from_raw_parts(data, len as usize) };
+            if !bytes.is_empty() {
                 frames.push(EncodedVideoFrame {
-                    data: Bytes::copy_from_slice(map.as_slice()),
-                    key: !buf.get_flags().contains(gst::BufferFlags::DELTA_UNIT),
-                    pts: buf.get_pts().mseconds().map_or(ms, |v| v as i64),
+                    data: Bytes::copy_from_slice(bytes),
+                    key: key != 0,
+                    pts: pts_us / 1000,
                     ..Default::default()
                 });
             }
+            unsafe { jz_enc_release(self.enc, index) };
         }
+        self.reclaim_slots(0);
         if frames.is_empty() {
-            self.check_bus()?;
             bail!("no valid frame");
         }
         self.first = false;
@@ -207,25 +369,13 @@ impl EncoderApi for JetsonEncoder {
     }
 
     fn yuvfmt(&self) -> EncodeYuvFormat {
-        let (w, h) = (self.config.width, self.config.height);
-        match self.input {
-            // GstVideoInfo's default NV12 layout: 4-aligned stride, UV plane right after Y.
-            Pixfmt::NV12 => EncodeYuvFormat {
-                pixfmt: Pixfmt::NV12,
-                w,
-                h,
-                stride: vec![nv12_stride(w), nv12_stride(w)],
-                u: nv12_stride(w) * round_up_2(h),
-                v: 0,
-            },
-            _ => EncodeYuvFormat {
-                pixfmt: Pixfmt::BGRA,
-                w,
-                h,
-                stride: vec![w * 4],
-                u: 0,
-                v: 0,
-            },
+        EncodeYuvFormat {
+            pixfmt: Pixfmt::BGRA,
+            w: self.config.width,
+            h: self.config.height,
+            stride: vec![self.config.width * 4],
+            u: 0,
+            v: 0,
         }
     }
 
@@ -237,10 +387,9 @@ impl EncoderApi for JetsonEncoder {
     fn set_quality(&mut self, ratio: f32) -> ResultType<()> {
         let bitrate = Self::calc_bitrate(&self.config, ratio);
         if bitrate > 0 {
-            // nvv4l2 encoders apply a new bitrate while PLAYING.
-            self.enc
-                .set_property("bitrate", &(bitrate * 1000))
-                .map_err(|e| anyhow!("set bitrate: {e}"))?;
+            if unsafe { jz_enc_set_bitrate(self.enc, bitrate * 1000) } != 0 {
+                bail!("jetson: set bitrate: {}", std::io::Error::last_os_error());
+            }
             self.bitrate = bitrate;
         }
         self.config.quality = ratio;
@@ -269,96 +418,98 @@ impl EncoderApi for JetsonEncoder {
 }
 
 impl JetsonEncoder {
-    fn create(config: JetsonEncoderConfig, input: Pixfmt) -> ResultType<Self> {
-        gst::init()?;
-        let element = element_name(config.format)
+    fn create(config: JetsonEncoderConfig) -> ResultType<Self> {
+        let codec = codec_id(config.format)
             .ok_or(anyhow!("jetson: unsupported format {:?}", config.format))?;
-        let (w, h) = (config.width, config.height);
-        let (caps_format, frame_size) = match input {
-            // libyuv's ARGBToNV12 is BT.601; without this GStreamer assumes BT.709 for HD.
-            Pixfmt::NV12 => (
-                "NV12,colorimetry=bt601",
-                nv12_stride(w) * (round_up_2(h) + round_up_2(h) / 2),
-            ),
-            _ => ("BGRx", w * h * 4),
-        };
         let bitrate = Self::calc_bitrate(&config, config.quality);
         let gop = config
             .keyframe_interval
             .map(|v| v as u32)
             .unwrap_or(DEFAULT_GOP);
-        let codec_props = match config.format {
-            // poc-type=2: no frame reordering, decode order == display order.
-            CodecFormat::H264 => "profile=4 insert-sps-pps=true insert-vui=true poc-type=2",
-            CodecFormat::H265 => "profile=0 insert-sps-pps=true insert-vui=true",
-            CodecFormat::AV1 => "insert-seq-hdr=true",
-            _ => "",
+        let mut err = [0 as c_char; 256];
+        let enc = unsafe {
+            jz_enc_open(
+                codec,
+                config.width as _,
+                config.height as _,
+                bitrate * 1000,
+                gop,
+                SLOTS as _,
+                err.as_mut_ptr(),
+                err.len(),
+            )
         };
-        let out_caps = match config.format {
-            CodecFormat::H264 => " ! video/x-h264,stream-format=byte-stream,alignment=au",
-            CodecFormat::H265 => " ! video/x-h265,stream-format=byte-stream,alignment=au",
-            _ => "",
-        };
-        let desc = format!(
-            "appsrc name=src is-live=true do-timestamp=false format=time block=false \
-               caps=video/x-raw,format={caps_format},width={w},height={h},framerate=30/1 \
-             ! nvvidconv ! video/x-raw(memory:NVMM),format=NV12,colorimetry=bt601 \
-             ! {element} name=enc control-rate=1 bitrate={br} iframeinterval={gop} \
-               idrinterval={gop} preset-level=1 maxperf-enable=true {codec_props} \
-             {out_caps} \
-             ! appsink name=sink sync=false emit-signals=false max-buffers=8 drop=false",
-            br = bitrate as u64 * 1000,
+        if enc.is_null() {
+            let err = unsafe { CStr::from_ptr(err.as_ptr()) }.to_string_lossy();
+            bail!("jetson: open {:?} encoder: {err}", config.format);
+        }
+        log::info!(
+            "jetson encoder: {:?} {}x{} {} kbps",
+            config.format,
+            config.width,
+            config.height,
+            bitrate
         );
-        log::info!("jetson encoder pipeline: {desc}");
-        let pipeline = gst::parse_launch(&desc)
-            .context("jetson: parse_launch")?
-            .downcast::<gst::Pipeline>()
-            .map_err(|_| anyhow!("jetson: not a pipeline"))?;
-        let get = |name: &str| {
-            pipeline
-                .get_by_name(name)
-                .ok_or(anyhow!("jetson: no element {name}"))
-        };
-        let appsrc = get("src")?
-            .dynamic_cast::<AppSrc>()
-            .map_err(|_| anyhow!("jetson: src is not appsrc"))?;
-        let appsink = get("sink")?
-            .dynamic_cast::<AppSink>()
-            .map_err(|_| anyhow!("jetson: sink is not appsink"))?;
-        let enc = get("enc")?;
-        let encoder = Self {
-            pipeline,
-            appsrc,
-            appsink,
+        Ok(Self {
             enc,
             config,
-            input,
-            frame_size,
             bitrate,
+            slots: Default::default(),
+            upload: None,
+            cpu_pool: Vec::new(),
+            last: None,
             in_flight: 0,
             first: true,
-        };
-        encoder
-            .pipeline
-            .set_state(gst::State::Playing)
-            .map_err(|e| anyhow!("jetson: set Playing: {e:?}"))?;
-        encoder.check_bus()?;
-        Ok(encoder)
+        })
     }
 
-    fn check_bus(&self) -> ResultType<()> {
-        if let Some(bus) = self.pipeline.get_bus() {
-            if let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error]) {
-                if let gst::MessageView::Error(err) = msg.view() {
-                    bail!(
-                        "jetson pipeline error: {} ({:?})",
-                        err.get_error(),
-                        err.get_debug()
-                    );
-                }
-            }
+    fn upload_cpu_frame(&mut self, data: &[u8]) -> ResultType<Arc<JetsonSurface>> {
+        let (w, h) = (self.config.width, self.config.height);
+        if data.len() < w * h * 4 {
+            bail!("frame too small: {} < {}", data.len(), w * h * 4);
         }
-        Ok(())
+        if self.upload.is_none() {
+            self.upload = Some(JetsonSurface::alloc(w, h, JZ_FMT_BGRA)?);
+        }
+        self.reclaim_slots(0);
+        let upload = self.upload.as_ref().ok_or(anyhow!("jetson: no upload surface"))?;
+        if unsafe { jz_upload(upload.ptr, data.as_ptr(), (w * 4) as _, w as _, h as _) } != 0 {
+            bail!("jetson: upload failed");
+        }
+        let nv12 = match self.cpu_pool.iter().find(|s| Arc::strong_count(s) == 1) {
+            Some(s) => s.clone(),
+            None => {
+                let s = Arc::new(JetsonSurface::alloc_nv12(w, h)?);
+                self.cpu_pool.push(s.clone());
+                s
+            }
+        };
+        upload.convert_into(&nv12)?;
+        Ok(nv12)
+    }
+
+    fn reclaim_slots(&mut self, timeout_ms: c_int) -> bool {
+        let mut any = false;
+        let mut timeout = timeout_ms;
+        loop {
+            let index = unsafe { jz_enc_reclaim(self.enc, timeout) };
+            if index < 0 || index as usize >= SLOTS {
+                return any;
+            }
+            self.slots[index as usize] = None;
+            any = true;
+            timeout = 0;
+        }
+    }
+
+    fn free_slot(&mut self) -> ResultType<usize> {
+        for wait in [0, FRAME_TIMEOUT_MS] {
+            if let Some(i) = self.slots.iter().position(|s| s.is_none()) {
+                return Ok(i);
+            }
+            self.reclaim_slots(wait);
+        }
+        bail!("jetson: encoder did not release an input frame");
     }
 
     // Same curve as the other hardware encoders (hwcodec.rs `calc_bitrate`), in kbps.
@@ -409,7 +560,7 @@ impl JetsonEncoder {
         {
             return false;
         }
-        // nvv4l2av1enc (L4T R36.4) intermittently emits streams that stop decoding after a few
+        // The L4T R36.4 AV1 encoder intermittently emits streams that stop decoding after a few
         // frames at some widths (1366, 1376, 3440 seen), so AV1 is opt-in.
         if format == CodecFormat::AV1
             && std::env::var("RUSTDESK_JETSON_AV1").map_or(true, |v| v != "1")
@@ -427,17 +578,6 @@ impl JetsonEncoder {
         if !std::path::Path::new(NVENC_DEVICE).exists() {
             return false;
         }
-        if gst::init().is_err() {
-            return false;
-        }
-        let Some(element) = element_name(format) else {
-            return false;
-        };
-        if gst::ElementFactory::find(element).is_none()
-            || gst::ElementFactory::find("nvvidconv").is_none()
-        {
-            return false;
-        }
         let config = JetsonEncoderConfig {
             format,
             width: 256,
@@ -446,8 +586,8 @@ impl JetsonEncoder {
             keyframe_interval: None,
         };
         let result = (|| -> ResultType<()> {
-            let mut enc = Self::create(config, Pixfmt::BGRA)?;
-            let frame = vec![0x80u8; enc.frame_size];
+            let mut enc = Self::create(config)?;
+            let frame = vec![0x80u8; 256 * 256 * 4];
             enc.encode_to_message(EncodeInput::YUV(&frame), 0)?;
             Ok(())
         })();
@@ -460,14 +600,8 @@ impl JetsonEncoder {
 
 impl Drop for JetsonEncoder {
     fn drop(&mut self) {
-        // Let the encoder drain before NULL; tearing down with a frame inside nvv4l2av1enc can
-        // wedge the next AV1 session.
-        self.appsrc.end_of_stream().ok();
-        let deadline = std::time::Instant::now() + Duration::from_millis(500);
-        while !self.appsink.is_eos() && std::time::Instant::now() < deadline {
-            self.appsink
-                .try_pull_sample(gst::ClockTime::from_mseconds(50));
-        }
-        self.pipeline.set_state(gst::State::Null).ok();
+        // STREAMOFF returns every queued buffer; only then may the surfaces go.
+        unsafe { jz_enc_close(self.enc) };
+        self.slots = Default::default();
     }
 }

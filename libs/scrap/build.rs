@@ -230,6 +230,10 @@ fn main() {
     // in this crate, these are also valid configurations
     println!("cargo:rustc-check-cfg=cfg(dxgi,quartz,x11)");
 
+    if env::var_os("CARGO_FEATURE_JETSON").is_some() {
+        build_jetson();
+    }
+
     // there is problem with cfg(target_os) in build.rs, so use our workaround
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
 
@@ -263,5 +267,23 @@ fn main() {
     } else if cfg!(unix) {
         // On UNIX we pray that X11 (with XCB) is available.
         println!("cargo:rustc-cfg=x11");
+    }
+}
+
+// NvBufSurface / VIC / V4L2 encoder shim for common/jetson.rs, against the Jetson Multimedia API
+// headers (package nvidia-l4t-jetson-multimedia-api).
+fn build_jetson() {
+    let include = env::var("JETSON_MMAPI_INCLUDE")
+        .unwrap_or_else(|_| "/usr/src/jetson_multimedia_api/include".to_owned());
+    println!("cargo:rerun-if-env-changed=JETSON_MMAPI_INCLUDE");
+    println!("cargo:rerun-if-changed=src/common/jetson_nv.c");
+    cc::Build::new()
+        .file("src/common/jetson_nv.c")
+        .include(&include)
+        .warnings(false)
+        .compile("jetson_nv");
+    println!("cargo:rustc-link-search=native=/usr/lib/aarch64-linux-gnu/nvidia");
+    for lib in ["nvbufsurface", "nvbufsurftransform", "v4l2"] {
+        println!("cargo:rustc-link-lib=dylib={lib}");
     }
 }

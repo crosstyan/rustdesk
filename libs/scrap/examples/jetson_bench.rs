@@ -2,8 +2,6 @@
 // frame with the client-side `Decoder`, and report CPU cost and color fidelity.
 //
 //   cargo run --release -p scrap --features jetson,hwcodec,wayland --example jetson_bench -- [frames]
-//
-// Env: RUSTDESK_JETSON_INPUT=nv12 converts on the CPU (libyuv) instead of on the VIC.
 
 #[cfg(feature = "jetson")]
 fn main() {
@@ -42,7 +40,7 @@ fn main() {
                 let r = enc.encode_to_message(scrap::EncodeInput::YUV(&frame), 0);
                 let t_enc = t.elapsed();
                 drop(enc);
-                println!("probe {f:?} #{i}: encode ok={} {:?}, total {:?}", r.is_ok(), t_enc, t.elapsed());
+                println!("probe {f:?} #{i}: encode {:?} {:?}, total {:?}", r.as_ref().map(|_| ()), t_enc, t.elapsed());
             }
         }
         return;

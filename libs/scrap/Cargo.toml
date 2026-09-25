@@ -26,7 +26,7 @@ linux-pkg-config = ["dep:pkg-config"]
 hwcodec = ["dep:hwcodec"]
 vram = ["hwcodec/vram"]
 # NVIDIA Jetson NVENC (H.264/H.265/AV1) through GStreamer `nvv4l2*enc`, see common/jetson.rs.
-jetson = ["gstreamer", "gstreamer-app"]
+jetson = []
 
 [dependencies]
 cfg-if = "1.0"
@@ -61,6 +61,7 @@ quest = "0.3"
 
 [build-dependencies]
 target_build_utils = "0.3"
+cc = "1.0"
 bindgen = "0.72.1"
 pkg-config = { version = "0.3.27", optional = true }
 
